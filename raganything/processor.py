@@ -512,22 +512,35 @@ class ProcessorMixin:
                         src, tgt, edge_data=edge_data
                     )
 
-    async def build_page_entity_topic_relations_text_only(self) -> None:
+    async def build_page_entity_topic_relations_text_only(
+        self,
+        page_topics: Dict[int, str],
+        content_list: List[Dict[str, Any]],
+        doc_id: str,
+        file_path: str,
+        separator: str = "\n<<<PAGE_BREAK>>>\n",
+        page_marker_re: str | re.Pattern = r"<<PAGE:(\d+)>>",
+    ) -> None:
         """
         Build relations between page entities and page topic entities (text-only).
 
         Requirements:
-        - No input arguments
-        - Uses cached page_topics dict and latest parsed content
-        - Inserts page-separated text into LightRAG for chunking
+        - Uses explicit inputs only (no cached state)
+        - Text with page markers must have been inserted into LightRAG beforehand
         - Maps entity source_id(chunk_id) to page_idx, then links to page topic
         """
 
-        if not hasattr(self, "_page_topics_dict") or not self._page_topics_dict:
-            raise RuntimeError("未找到页主题字典，请先调用 extract_page_topics")
+        if not page_topics:
+            raise RuntimeError("page_topics 为空，请先调用 extract_page_topics")
 
-        if not hasattr(self, "_latest_content_list") or not self._latest_content_list:
-            raise RuntimeError("未找到解析内容，请先调用 parse_document")
+        if not content_list:
+            raise RuntimeError("content_list 为空，请先完成解析")
+
+        if not doc_id:
+            raise RuntimeError("doc_id 不能为空，请传入文本插入时的 doc_id")
+
+        if not file_path:
+            raise RuntimeError("file_path 不能为空，请传入原始文件路径")
 
         init_result = await self._ensure_lightrag_initialized()
         if isinstance(init_result, dict) and not init_result.get("success", True):
@@ -535,15 +548,13 @@ class ProcessorMixin:
                 f"LightRAG 初始化失败: {init_result.get('error', 'unknown error')}"
             )
 
-        _, _, page_texts = separate_content(
-            self._latest_content_list, return_page_texts=True
-        )
+        if isinstance(page_marker_re, str):
+            page_marker_re = re.compile(page_marker_re)
+
+        _, _, page_texts = separate_content(content_list, return_page_texts=True)
         if not page_texts:
             self.logger.warning("没有可用的纯文本页内容，跳过页实体关系构建")
             return
-
-        page_marker_re = re.compile(r"<<PAGE:(\d+)>>")
-        separator = "\n<<<PAGE_BREAK>>>\n"
 
         page_chunks: List[str] = []
         for page_idx in sorted(page_texts.keys()):
@@ -557,27 +568,19 @@ class ProcessorMixin:
             return
 
         full_text = separator.join(page_chunks)
-        base_doc_id = getattr(self, "_latest_doc_id", None)
-        doc_id = (
-            f"{base_doc_id}-page-text" if base_doc_id else compute_mdhash_id(full_text, prefix="doc-page-")
-        )
-
-        file_ref = getattr(self, "_latest_file_path", None)
-        if file_ref:
-            file_ref = self._get_file_reference(file_ref)
-        else:
-            file_ref = "page_text_only"
+        page_text_doc_id = f"{doc_id}-page-text"
+        file_ref = self._get_file_reference(file_path)
 
         await insert_text_content(
             self.lightrag,
             input=full_text,
             split_by_character=separator,
             split_by_character_only=True,
-            ids=doc_id,
+            ids=page_text_doc_id,
             file_paths=file_ref,
         )
 
-        doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
+        doc_status = await self.lightrag.doc_status.get_by_id(page_text_doc_id)
         if not doc_status:
             raise RuntimeError("无法获取 doc_status，请确认文本已成功插入")
 
@@ -619,7 +622,7 @@ class ProcessorMixin:
                     continue
 
                 page_idx = chunk_to_page[cid]
-                page_topic = self._page_topics_dict.get(page_idx)
+                page_topic = page_topics.get(page_idx)
                 if not page_topic:
                     continue
 
@@ -845,6 +848,10 @@ class ProcessorMixin:
                 self.logger.info(
                     f"* Total blocks in cached content_list: {len(content_list)}"
                 )
+            # Cache latest parse for downstream page-entity linking
+            self._latest_content_list = content_list
+            self._latest_doc_id = doc_id
+            self._latest_file_path = str(file_path)
             return content_list, doc_id
 
         # Choose appropriate parsing method based on file extension
