@@ -136,6 +136,118 @@ class ProcessorMixin:
 
         return doc_id
 
+    def _generate_page_topics_cache_key(
+        self, content_list: List[Dict[str, Any]], use_llm: bool, max_chars: int
+    ) -> str:
+        """
+        Generate cache key for page topics based on content and parameters.
+
+        Args:
+            content_list: Parsed content list
+            use_llm: Whether LLM-based topic extraction is enabled
+            max_chars: Max characters used for LLM prompt
+
+        Returns:
+            str: Cache key hash
+        """
+        doc_id = self._generate_content_based_doc_id(content_list)
+        cache_data = {
+            "doc_id": doc_id,
+            "use_llm": bool(use_llm),
+            "max_chars": int(max_chars),
+        }
+        cache_str = json.dumps(cache_data, sort_keys=True, ensure_ascii=False)
+        return hashlib.md5(cache_str.encode()).hexdigest()
+
+    async def _get_cached_page_topics(
+        self,
+        cache_key: str,
+        content_list: List[Dict[str, Any]],
+        use_llm: bool,
+        max_chars: int,
+    ) -> Dict[int, str] | None:
+        """
+        Get cached page topics if available and valid.
+
+        Returns:
+            Dict[int, str] | None: page topics dict or None if invalid/missing
+        """
+        if not hasattr(self, "page_topics_cache") or self.page_topics_cache is None:
+            return None
+
+        try:
+            cached_data = await self.page_topics_cache.get_by_id(cache_key)
+            if not cached_data:
+                return None
+
+            current_doc_id = self._generate_content_based_doc_id(content_list)
+            cached_doc_id = cached_data.get("doc_id")
+            if cached_doc_id != current_doc_id:
+                self.logger.debug(f"Page topics cache invalid - doc changed: {cache_key}")
+                return None
+
+            cached_config = cached_data.get("topic_config", {})
+            current_config = {
+                "use_llm": bool(use_llm),
+                "max_chars": int(max_chars),
+            }
+
+            if cached_config != current_config:
+                self.logger.debug(
+                    f"Page topics cache invalid - config changed: {cache_key}"
+                )
+                return None
+
+            page_topics = cached_data.get("page_topics")
+            if isinstance(page_topics, dict) and page_topics:
+                self.logger.debug(
+                    f"Found valid cached page topics for key: {cache_key}"
+                )
+                return page_topics
+
+            self.logger.debug(
+                f"Page topics cache incomplete - missing page_topics: {cache_key}"
+            )
+            return None
+
+        except Exception as e:
+            self.logger.warning(f"Error accessing page topics cache: {e}")
+            return None
+
+    async def _store_cached_page_topics(
+        self,
+        cache_key: str,
+        content_list: List[Dict[str, Any]],
+        page_topics: Dict[int, str],
+        use_llm: bool,
+        max_chars: int,
+    ) -> None:
+        """
+        Store page topics in cache.
+        """
+        if not hasattr(self, "page_topics_cache") or self.page_topics_cache is None:
+            return
+
+        try:
+            doc_id = self._generate_content_based_doc_id(content_list)
+            cache_data = {
+                cache_key: {
+                    "doc_id": doc_id,
+                    "page_topics": page_topics,
+                    "topic_config": {
+                        "use_llm": bool(use_llm),
+                        "max_chars": int(max_chars),
+                    },
+                    "cached_at": time.time(),
+                    "cache_version": "1.0",
+                }
+            }
+            await self.page_topics_cache.upsert(cache_data)
+            await self.page_topics_cache.index_done_callback()
+            self.logger.info(f"Stored page topics in cache: {cache_key}")
+        except Exception as e:
+            self.logger.warning(f"Error storing page topics to cache: {e}")
+
     async def _call_llm_model(
         self, prompt: str, system_prompt: str | None = None
     ) -> str:
@@ -286,6 +398,25 @@ class ProcessorMixin:
         if not content_list:
             return {}
 
+        # Resolve effective LLM usage based on availability
+        effective_use_llm = (
+            bool(use_llm)
+            and hasattr(self, "llm_model_func")
+            and self.llm_model_func is not None
+        )
+
+        # Check cache first
+        cache_key = self._generate_page_topics_cache_key(
+            content_list, effective_use_llm, max_chars
+        )
+        cached_topics = await self._get_cached_page_topics(
+            cache_key, content_list, effective_use_llm, max_chars
+        )
+        if cached_topics is not None:
+            self._page_topics_dict = cached_topics
+            self.logger.info("Using cached page topics")
+            return cached_topics
+
         page_buckets: Dict[int, List[Dict[str, Any]]] = {}
         for item in content_list:
             if not isinstance(item, dict):
@@ -371,7 +502,7 @@ class ProcessorMixin:
                 page_topics[page_idx] = fallback_topic
                 continue
 
-            if not use_llm or not hasattr(self, "llm_model_func") or self.llm_model_func is None:
+            if not effective_use_llm:
                 page_topics[page_idx] = fallback_topic
                 continue
 
@@ -395,6 +526,9 @@ class ProcessorMixin:
                 page_topics[page_idx] = fallback_topic
 
         self._page_topics_dict = page_topics
+        await self._store_cached_page_topics(
+            cache_key, content_list, page_topics, effective_use_llm, max_chars
+        )
         return page_topics
 
 
