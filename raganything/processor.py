@@ -582,6 +582,9 @@ class ProcessorMixin:
             else:
                 merged[norm]["pages"].append(int(page_idx))
 
+        # Prepare entities_vdb payload for page topics
+        entities_vdb_payload: Dict[str, Any] = {}
+
         topics = [item["topic"] for item in merged.values()]
         if len(topics) < 2:
             # still ensure nodes are stored
@@ -598,6 +601,20 @@ class ProcessorMixin:
                 await self.lightrag.chunk_entity_relation_graph.upsert_node(
                     item["topic"], node_data=node_data
                 )
+
+                # Store page topic entity into entities_vdb for vector search
+                entity_id = compute_mdhash_id(item["topic"], prefix="ent-")
+                entities_vdb_payload[entity_id] = {
+                    "entity_name": item["topic"],
+                    "entity_type": "page_topic",
+                    "content": f"{item['topic']}\n{node_data['description']}",
+                    "source_id": "page_topic_dict",
+                    "file_path": file_path,
+                }
+
+            if entities_vdb_payload:
+                await self.lightrag.entities_vdb.upsert(entities_vdb_payload)
+                await self.lightrag.entities_vdb.index_done_callback()
             return
 
         # Compute embeddings
@@ -624,6 +641,20 @@ class ProcessorMixin:
             await self.lightrag.chunk_entity_relation_graph.upsert_node(
                 item["topic"], node_data=node_data
             )
+
+            # Store page topic entity into entities_vdb for vector search
+            entity_id = compute_mdhash_id(item["topic"], prefix="ent-")
+            entities_vdb_payload[entity_id] = {
+                "entity_name": item["topic"],
+                "entity_type": "page_topic",
+                "content": f"{item['topic']}\n{node_data['description']}",
+                "source_id": "page_topic_dict",
+                "file_path": file_path,
+            }
+
+        if entities_vdb_payload:
+            await self.lightrag.entities_vdb.upsert(entities_vdb_payload)
+            await self.lightrag.entities_vdb.index_done_callback()
 
         # Create edges based on cosine similarity
         topic_list = [item["topic"] for item in merged.values()]
@@ -702,7 +733,6 @@ class ProcessorMixin:
             return
 
         full_text = separator.join(page_chunks)
-        page_text_doc_id = f"{doc_id}-page-text"
         file_ref = self._get_file_reference(file_path)
 
         await insert_text_content(
@@ -710,11 +740,11 @@ class ProcessorMixin:
             input=full_text,
             split_by_character=separator,
             split_by_character_only=True,
-            ids=page_text_doc_id,
+            ids=doc_id,
             file_paths=file_ref,
         )
 
-        doc_status = await self.lightrag.doc_status.get_by_id(page_text_doc_id)
+        doc_status = await self.lightrag.doc_status.get_by_id(doc_id)
         if not doc_status:
             raise RuntimeError("无法获取 doc_status，请确认文本已成功插入")
 
